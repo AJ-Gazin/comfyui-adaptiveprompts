@@ -19,10 +19,10 @@ import yaml
 BRACKET_PATTERN = re.compile(r"\{([^{}]+)\}")
 
 # Wildcards + variables:
-# - name may include letters/digits/_/-/* and '/'
+# - name may include letters/digits/_/-/* and '/' and spaces (for YAML paths)
 # - optional ^var after the name (var may include trailing *)
 # - also supports pure variable recall: __^var__
-FILE_PATTERN = re.compile(r"__(?:([a-zA-Z0-9_\-/*]+?))?(?:\^([a-zA-Z0-9_\-\*]+))?__")
+FILE_PATTERN = re.compile(r"__(?:([a-zA-Z0-9_\-/* ]+?))?(?:\^([a-zA-Z0-9_\-\*]+))?__")
 
 # Normalize spacing between adjacent wildcard-ish tokens (allow ^ and *)
 ADJ_WC_PATTERN = re.compile(r"(__[a-zA-Z0-9_\-/*\^\*]+__)(__[a-zA-Z0-9_\-/*\^\*]+__)")
@@ -161,6 +161,13 @@ def _load_weighted_file(filepath: str):
     except OSError:
         return [], []
 
+def _normalize_wildcard_key(key: str) -> str:
+    """
+    Normalize a wildcard key to match Impact Pack behavior.
+    Converts to lowercase and replaces spaces with hyphens.
+    """
+    return key.replace(' ', '-').lower()
+
 def _load_yaml_path(filepath: str, path_parts: list[str]):
     """
     Load a YAML file and navigate to the specified path.
@@ -170,24 +177,28 @@ def _load_yaml_path(filepath: str, path_parts: list[str]):
         filepath: Path to the .yaml/.yml file
         path_parts: List of keys to navigate (e.g., ['NSFW-DB', 'prompt', 'censoredKey'])
 
-    Note: Keys are matched case-insensitively to match Impact Pack behavior.
+    Note: Keys are matched case-insensitively with space-to-hyphen normalization
+          to match Impact Pack behavior.
     """
     try:
         with open(filepath, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
 
-        # Navigate through the nested structure (case-insensitive matching)
+        # Navigate through the nested structure (normalized key matching)
         current = data
         for part in path_parts:
             if isinstance(current, dict):
-                # Case-insensitive key matching
+                # Normalize the search key (lowercase, spaces to hyphens)
+                part_normalized = _normalize_wildcard_key(part)
+
+                # Find matching key in dict (with normalization)
                 found = False
-                part_lower = part.lower()
                 for key in current.keys():
-                    if key.lower() == part_lower:
+                    if _normalize_wildcard_key(key) == part_normalized:
                         current = current[key]
                         found = True
                         break
+
                 if not found:
                     return [], []
             else:
@@ -201,7 +212,7 @@ def _load_yaml_path(filepath: str, path_parts: list[str]):
             return [current], [1.0]
         else:
             return [], []
-    except (OSError, yaml.YAMLError, AttributeError, KeyError):
+    except (OSError, yaml.YAMLError, AttributeError, KeyError) as e:
         return [], []
 
 def _weighted_index(weights, rng: random.Random) -> int:
