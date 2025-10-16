@@ -13,6 +13,7 @@ Changes:
 import re
 import os
 import random
+import yaml
 
 
 BRACKET_PATTERN = re.compile(r"\{([^{}]+)\}")
@@ -160,6 +161,49 @@ def _load_weighted_file(filepath: str):
     except OSError:
         return [], []
 
+def _load_yaml_path(filepath: str, path_parts: list[str]):
+    """
+    Load a YAML file and navigate to the specified path.
+    Returns (items, weights) for the values at that path.
+
+    Args:
+        filepath: Path to the .yaml/.yml file
+        path_parts: List of keys to navigate (e.g., ['NSFW-DB', 'prompt', 'censoredKey'])
+
+    Note: Keys are matched case-insensitively to match Impact Pack behavior.
+    """
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+
+        # Navigate through the nested structure (case-insensitive matching)
+        current = data
+        for part in path_parts:
+            if isinstance(current, dict):
+                # Case-insensitive key matching
+                found = False
+                part_lower = part.lower()
+                for key in current.keys():
+                    if key.lower() == part_lower:
+                        current = current[key]
+                        found = True
+                        break
+                if not found:
+                    return [], []
+            else:
+                return [], []
+
+        # Current should now be a list of options
+        if isinstance(current, list):
+            return _parse_weighted_options(current)
+        elif isinstance(current, str):
+            # Single value, treat as one item
+            return [current], [1.0]
+        else:
+            return [], []
+    except (OSError, yaml.YAMLError, AttributeError, KeyError):
+        return [], []
+
 def _weighted_index(weights, rng: random.Random) -> int:
     """
     Return an index sampled according to 'weights' (all non-negative).
@@ -179,23 +223,40 @@ def _weighted_index(weights, rng: random.Random) -> int:
 
 # -------------------------- Bracket deck context ----------------------------
 
-def _ensure_deck_for_file(ctx: dict, filepath: str):
+def _ensure_deck_for_file(ctx: dict, filepath: str, yaml_path_parts: list[str] | None = None):
     """
     Ensure a deck for 'filepath' exists in ctx['decks'].
     A deck keeps a list of remaining items + weights (for NO-REPEAT draws),
     plus the full copies for refilling if overflow is enabled.
+
+    Args:
+        ctx: Context dictionary containing decks
+        filepath: Path to the file (.txt or .yaml/.yml)
+        yaml_path_parts: If provided, navigate this path within the YAML file
     """
     decks = ctx.setdefault("decks", {})
-    if filepath in decks:
-        return decks[filepath]
-    items, weights = _load_weighted_file(filepath)
+    # Create a unique key for this deck (filepath + yaml path if applicable)
+    if yaml_path_parts:
+        deck_key = f"{filepath}::{'/'.join(yaml_path_parts)}"
+    else:
+        deck_key = filepath
+
+    if deck_key in decks:
+        return decks[deck_key]
+
+    # Load items based on file type
+    if yaml_path_parts and (filepath.endswith('.yaml') or filepath.endswith('.yml')):
+        items, weights = _load_yaml_path(filepath, yaml_path_parts)
+    else:
+        items, weights = _load_weighted_file(filepath)
+
     deck = {
         "all_items": list(items),
         "all_weights": list(weights),
         "remain_items": list(items),
         "remain_weights": list(weights),
     }
-    decks[filepath] = deck
+    decks[deck_key] = deck
     return deck
 
 def _deck_draw(deck: dict, rng: random.Random, allow_overflow: bool) -> str | None:
@@ -220,8 +281,20 @@ def _deck_draw(deck: dict, rng: random.Random, allow_overflow: bool) -> str | No
 
 # ---------------------- File I/O / wildcard selection -----------------------
 
-def _read_weighted_line(filepath: str, rng: random.Random) -> str:
-    items, weights = _load_weighted_file(filepath)
+def _read_weighted_line(filepath: str, rng: random.Random, yaml_path_parts: list[str] | None = None) -> str:
+    """
+    Read and return a weighted random line from a file.
+
+    Args:
+        filepath: Path to the file (.txt or .yaml/.yml)
+        rng: Random number generator
+        yaml_path_parts: If provided, navigate this path within the YAML file
+    """
+    if yaml_path_parts and (filepath.endswith('.yaml') or filepath.endswith('.yml')):
+        items, weights = _load_yaml_path(filepath, yaml_path_parts)
+    else:
+        items, weights = _load_weighted_file(filepath)
+
     if not items:
         return ""
     idx = _weighted_index(weights, rng)
@@ -230,14 +303,26 @@ def _read_weighted_line(filepath: str, rng: random.Random) -> str:
 def _choose_file_from_dir(dir_path: str,
                           rng: random.Random,
                           prefix: str | None = None) -> str | None:
+    """
+    Choose a random wildcard file from a directory.
+    Supports .txt, .yaml, and .yml files.
+    """
     if not os.path.isdir(dir_path):
         return None
     candidates = []
     try:
         for f in os.listdir(dir_path):
-            if not f.lower().endswith(".txt"):
+            lower_f = f.lower()
+            # Check for supported extensions
+            if lower_f.endswith(".txt"):
+                name_no_ext = f[:-4]
+            elif lower_f.endswith(".yaml"):
+                name_no_ext = f[:-5]
+            elif lower_f.endswith(".yml"):
+                name_no_ext = f[:-4]
+            else:
                 continue
-            name_no_ext = f[:-4]
+
             if prefix is None or name_no_ext.startswith(prefix):
                 candidates.append(os.path.join(dir_path, f))
     except OSError:
@@ -251,7 +336,13 @@ def process_file_wildcard(name: str,
                           wildcard_dir: str,
                           bracket_ctx: dict | None = None) -> str:
     """
-    file patterns supported (same as before). This version will:
+    Process file wildcards with support for .txt, .yaml, and .yml files.
+
+    For YAML files, paths like "NSFW-DB/prompt/censoredKey" will:
+      1. Look for NSFW-DB.yaml (or .yml)
+      2. Navigate to ['NSFW-DB']['prompt']['censoredKey'] in the YAML structure
+
+    This version will:
       - Try to resolve files relative to the provided wildcard_dir first.
       - If a file/directory is missing there, attempt the equivalent path under
         DEFAULT_WILDCARD_ROOT (the global '/wildcards/' fallback).
@@ -282,16 +373,16 @@ def process_file_wildcard(name: str,
                 return fallback_fp
         return None
 
-    def draw_from_filepath(filepath: str) -> str:
+    def draw_from_filepath(filepath: str, yaml_path_parts: list[str] | None = None) -> str:
         # resolve actual filepath (primary -> fallback)
         actual_fp = _resolve_filepath(filepath)
         if not actual_fp:
             return ""
         # If no bracket context, do legacy single weighted draw
         if bracket_ctx is None:
-            return _read_weighted_line(actual_fp, rng)
+            return _read_weighted_line(actual_fp, rng, yaml_path_parts=yaml_path_parts)
         # Decked draw (no-repeat in this bracket) keyed by actual filepath
-        deck = _ensure_deck_for_file(bracket_ctx, actual_fp)
+        deck = _ensure_deck_for_file(bracket_ctx, actual_fp, yaml_path_parts=yaml_path_parts)
         picked = _deck_draw(deck, rng, allow_overflow=bool(bracket_ctx.get("allow_overflow", True)))
         return picked or ""
 
@@ -299,6 +390,20 @@ def process_file_wildcard(name: str,
     name = name.strip("/")
 
     if "/" in name:
+        # Split the path into parts
+        path_parts = name.split("/")
+        first_part = path_parts[0]
+
+        # Check if the first part is a YAML file (root level)
+        for ext in ['.yaml', '.yml']:
+            yaml_candidate = os.path.join(primary_dir, first_part + ext)
+            actual_yaml = _resolve_filepath(yaml_candidate)
+            if actual_yaml:
+                # This is a YAML file path like "NSFW-DB/prompt/censoredKey"
+                # Navigate using the full path including the root key
+                return draw_from_filepath(actual_yaml, yaml_path_parts=path_parts)
+
+        # Not a YAML file, proceed with old directory/file logic
         dir_part, last = name.rsplit("/", 1)
         dir_path = os.path.join(primary_dir, dir_part)
 
@@ -315,8 +420,8 @@ def process_file_wildcard(name: str,
                 chosen = _choose_file_from_dir(fallback_dir, rng, prefix=prefix)
             return draw_from_filepath(chosen) if chosen else ""
 
+        # Try as a text file in subdirectory
         filepath = os.path.join(dir_path, f"{last}.txt")
-        # try primary then fallback
         return draw_from_filepath(filepath)
 
     # Root-level cases
@@ -335,9 +440,19 @@ def process_file_wildcard(name: str,
             chosen = _choose_file_from_dir(DEFAULT_WILDCARD_ROOT, rng, prefix=prefix)
         return draw_from_filepath(chosen) if chosen else ""
 
-    # Specific file in primary dir -> fallback to default if missing
-    filepath = os.path.join(primary_dir, f"{name}.txt")
-    return draw_from_filepath(filepath)
+    # Specific file in primary dir
+    # Try .txt first, then .yaml, then .yml
+    for ext in ['.txt', '.yaml', '.yml']:
+        filepath = os.path.join(primary_dir, f"{name}{ext}")
+        actual_fp = _resolve_filepath(filepath)
+        if actual_fp:
+            # For YAML files at root level, use the filename as the first path part
+            if ext in ['.yaml', '.yml']:
+                return draw_from_filepath(actual_fp, yaml_path_parts=[name])
+            else:
+                return draw_from_filepath(actual_fp)
+
+    return ""
 
 def weighted_choice(options: list[str], rng: random.Random) -> str:
     items, weights = _parse_weighted_options(options)
